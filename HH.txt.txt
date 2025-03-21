@@ -1,0 +1,520 @@
+import os
+import time
+import random
+import string
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Set, Tuple
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Database simulation (in a real application, use a proper database)
+users = {}  # user_id: {"coins": int, "keys": List[str], "last_bonus": datetime, "referrals": List[int]}
+keys = {}   # key: {"value": int, "created_by": int, "used_by": int or None}
+admins = {5708896577}  # Set of admin user IDs (add your Telegram ID here)
+referral_links = {}  # user_id: referral_code
+attacks_in_progress = set()  # Set of user_ids with attacks in progress
+
+# Constants
+DAILY_BONUS_COINS = 5
+REFERRAL_BONUS = 1
+COINS_PER_KEY = 6
+MIN_COINS_FOR_ATTACK = 1
+
+# Binary attack script path (replace with actual path)
+ATTACK_BINARY_PATH = "./YTK"
+
+# States for conversation handler
+WAITING_FOR_TARGET, WAITING_FOR_DURATION, WAITING_FOR_KEY_VALUE = range(3)
+
+# Load environment variables
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")  # Replace with your actual token
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    user_id = update.effective_user.id
+    
+    # Initialize user if not exists
+    if user_id not in users:
+        users[user_id] = {
+            "coins": 100,  # Starting coins
+            "keys": [],
+            "last_bonus": datetime.now() - timedelta(days=1),  # Eligible for first bonus
+            "referrals": []
+        }
+        # Generate referral code
+        referral_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        referral_links[user_id] = referral_code
+    
+    # Check if started with referral code
+    if len(context.args) > 0 and context.args[0] in [referral_links[uid] for uid in referral_links]:
+        # Find referrer
+        for ref_user_id, ref_code in referral_links.items():
+            if ref_code == context.args[0] and user_id != ref_user_id:
+                if user_id not in users[ref_user_id]["referrals"]:
+                    users[ref_user_id]["referrals"].append(user_id)
+                    users[ref_user_id]["coins"] += REFERRAL_BONUS
+                    await update.message.reply_text(f"You were referred by a user! They received {REFERRAL_BONUS} bonus coins.")
+                break
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("⚡ Attack", callback_data="attack"),
+            InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_key")
+        ],
+        [
+            InlineKeyboardButton("🔐 Generate Key", callback_data="generate_key"),
+            InlineKeyboardButton("💰 Add Coins", callback_data="add_coin")
+        ],
+        [
+            InlineKeyboardButton("❌ Delete Key", callback_data="key_delete"),
+            InlineKeyboardButton("🔍 All Keys", callback_data="all_keys")
+        ],
+        [
+            InlineKeyboardButton("👤 My Account", callback_data="my_account"),
+            InlineKeyboardButton("📞 Contact Admin", callback_data="contact_admin")
+        ],
+        [
+            InlineKeyboardButton("🔗 My Referral Link", callback_data="refer_link"),
+            InlineKeyboardButton("🎁 Daily Bonus", callback_data="bonus")
+        ]
+    ]
+    
+    # Add admin panel button if user is admin
+    if user_id in admins:
+        keyboard.append([InlineKeyboardButton("🔧 Admin Panel", callback_data="admin_panel")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"Welcome to Attack Bot!\n\n"
+        f"Your current balance: {users[user_id]['coins']} coins\n"
+        f"Use the buttons below to navigate:",
+        reply_markup=reply_markup
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle button presses."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    # Make sure user exists
+    if user_id not in users:
+        await query.answer("Please use /start first!")
+        return ConversationHandler.END
+    
+    await query.answer()
+    
+    # Handle different button actions
+    if query.data == "attack":
+        await query.edit_message_text(
+            text="Enter the target IP address to attack:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Cancel", callback_data="cancel")
+            ]])
+        )
+        return WAITING_FOR_TARGET
+        
+    elif query.data == "redeem_key":
+        await query.edit_message_text(
+            text="Please send the key you want to redeem:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Cancel", callback_data="cancel")
+            ]])
+        )
+        
+    elif query.data == "generate_key":
+        if users[user_id]["coins"] < COINS_PER_KEY:
+            await query.edit_message_text(
+                text=f"You need {COINS_PER_KEY} coins to generate a key. You have {users[user_id]['coins']} coins.",
+                reply_markup=get_back_button()
+            )
+        else:
+            # Generate a random key
+            key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+            keys[key] = {"value": 500, "created_by": user_id, "used_by": None}
+            users[user_id]["keys"].append(key)
+            users[user_id]["coins"] -= COINS_PER_KEY
+            
+            await query.edit_message_text(
+                text=f"Key generated successfully: `{key}`\nValue: 500 coins",
+                reply_markup=get_back_button()
+            )
+            
+    elif query.data == "add_coin":
+        await query.edit_message_text(
+            text="Please enter the key to add coins to your account:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Cancel", callback_data="cancel")
+            ]])
+        )
+        
+    elif query.data == "key_delete":
+        if not users[user_id]["keys"]:
+            await query.edit_message_text(
+                text="You don't have any keys to delete.",
+                reply_markup=get_back_button()
+            )
+        else:
+            keyboard = []
+            for key in users[user_id]["keys"]:
+                keyboard.append([InlineKeyboardButton(key, callback_data=f"delete_{key}")])
+            keyboard.append([InlineKeyboardButton("Back", callback_data="back")])
+            
+            await query.edit_message_text(
+                text="Select a key to delete:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+    elif query.data == "all_keys":
+        if not users[user_id]["keys"]:
+            key_text = "You don't have any keys."
+        else:
+            key_text = "Your keys:\n\n"
+            for i, key in enumerate(users[user_id]["keys"], 1):
+                key_info = keys.get(key, {"value": "Unknown", "used_by": None})
+                status = "Unused" if key_info["used_by"] is None else "Used"
+                key_text += f"{i}. `{key}` - {key_info['value']} coins ({status})\n"
+        
+        await query.edit_message_text(
+            text=key_text,
+            reply_markup=get_back_button()
+        )
+        
+    elif query.data == "my_account":
+        user_data = users[user_id]
+        referral_code = referral_links.get(user_id, "Not available")
+        
+        account_text = (
+            f"👤 **Account Information**\n\n"
+            f"User ID: `{user_id}`\n"
+            f"Balance: {user_data['coins']} coins\n"
+            f"Keys: {len(user_data['keys'])}\n"
+            f"Referrals: {len(user_data['referrals'])}\n"
+            f"Referral Code: `{referral_code}`\n"
+            f"Last Bonus: {user_data['last_bonus'].strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await query.edit_message_text(
+            text=account_text,
+            reply_markup=get_back_button()
+        )
+        
+    elif query.data == "contact_admin":
+        await query.edit_message_text(
+            text="To contact the admin, please send a message to @AdminUsername",
+            reply_markup=get_back_button()
+        )
+        
+    elif query.data == "refer_link":
+        referral_code = referral_links.get(user_id, "Not available")
+        bot_username = context.bot.username
+        
+        await query.edit_message_text(
+            text=f"Share this link with friends to earn {REFERRAL_BONUS} coins for each referral:\n\n"
+                 f"https://t.me/{bot_username}?start={referral_code}",
+            reply_markup=get_back_button()
+        )
+        
+    elif query.data == "bonus":
+        last_bonus = users[user_id]["last_bonus"]
+        now = datetime.now()
+        
+        if now - last_bonus >= timedelta(hours=24):
+            users[user_id]["coins"] += DAILY_BONUS_COINS
+            users[user_id]["last_bonus"] = now
+            
+            await query.edit_message_text(
+                text=f"Daily bonus claimed! You received {DAILY_BONUS_COINS} coins.",
+                reply_markup=get_back_button()
+            )
+        else:
+            next_bonus = last_bonus + timedelta(hours=24)
+            hours_remaining = int((next_bonus - now).total_seconds() / 3600)
+            minutes_remaining = int(((next_bonus - now).total_seconds() % 3600) / 60)
+            
+            await query.edit_message_text(
+                text=f"You've already claimed your daily bonus.\nNext bonus available in: {hours_remaining}h {minutes_remaining}m",
+                reply_markup=get_back_button()
+            )
+            
+    elif query.data == "admin_panel" and user_id in admins:
+        keyboard = [
+            [InlineKeyboardButton("Add Admin", callback_data="admin_add")],
+            [InlineKeyboardButton("Add Coins to User", callback_data="admin_add_coins")],
+            [InlineKeyboardButton("View All Users", callback_data="admin_view_users")],
+            [InlineKeyboardButton("Back", callback_data="back")]
+        ]
+        
+        await query.edit_message_text(
+            text="Admin Panel",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    elif query.data == "back":
+        await start(update, context)
+        return ConversationHandler.END
+        
+    elif query.data == "cancel":
+        await start(update, context)
+        return ConversationHandler.END
+    
+    return ConversationHandler.END
+
+async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    target_ip = update.message.text
+    
+    # Store the target IP in context
+    context.user_data["target_ip"] = target_ip
+    
+    await update.message.reply_text(
+        "Enter attack duration in seconds (10-300):",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Cancel", callback_data="cancel")
+        ]])
+    )
+    return WAITING_FOR_DURATION
+
+async def handle_duration_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    
+    try:
+        duration = int(update.message.text)
+        if duration < 10 or duration > 300:
+            await update.message.reply_text(
+                "Duration must be between 10 and 300 seconds. Try again:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Cancel", callback_data="cancel")
+                ]])
+            )
+            return WAITING_FOR_DURATION
+            
+        # Calculate cost based on duration
+        attack_cost = duration * 10
+        
+        if users[user_id]["coins"] < attack_cost:
+            await update.message.reply_text(
+                f"You need {attack_cost} coins for this attack. You have {users[user_id]['coins']} coins.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Back to Menu", callback_data="back")
+                ]])
+            )
+            return ConversationHandler.END
+            
+        # Store duration in context
+        context.user_data["duration"] = duration
+        context.user_data["attack_cost"] = attack_cost
+        
+        target_ip = context.user_data["target_ip"]
+        
+        # Confirm attack
+        keyboard = [
+            [
+                InlineKeyboardButton("Confirm", callback_data="confirm_attack"),
+                InlineKeyboardButton("Cancel", callback_data="cancel")
+            ]
+        ]
+        
+        await update.message.reply_text(
+            f"Attack Summary:\n\n"
+            f"Target: {target_ip}\n"
+            f"Duration: {duration} seconds\n"
+            f"Cost: {attack_cost} coins\n\n"
+            f"Do you want to proceed?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text(
+            "Please enter a valid number for duration:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Cancel", callback_data="cancel")
+            ]])
+        )
+        return WAITING_FOR_DURATION
+
+async def confirm_attack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    
+    if query.data == "confirm_attack":
+        target_ip = context.user_data.get("target_ip")
+        duration = context.user_data.get("duration")
+        attack_cost = context.user_data.get("attack_cost")
+        
+        if not all([target_ip, duration, attack_cost]):
+            await query.edit_message_text(
+                text="Error: Attack information is incomplete. Please try again.",
+                reply_markup=get_back_button()
+            )
+            return
+            
+        # Check if user has enough coins
+        if users[user_id]["coins"] < attack_cost:
+            await query.edit_message_text(
+                text=f"You don't have enough coins for this attack. You need {attack_cost} coins.",
+                reply_markup=get_back_button()
+            )
+            return
+            
+        # Check if user already has an attack in progress
+        if user_id in attacks_in_progress:
+            await query.edit_message_text(
+                text="You already have an attack in progress. Please wait for it to finish.",
+                reply_markup=get_back_button()
+            )
+            return
+            
+        # Deduct coins
+        users[user_id]["coins"] -= attack_cost
+        
+        # Start the attack
+        attacks_in_progress.add(user_id)
+        await query.edit_message_text(text=f"⚡ Attack started on {target_ip} for {duration} seconds!")
+        
+        # Simulate running the binary
+        await run_attack(target_ip, duration, user_id, context)
+
+async def run_attack(target_ip: str, duration: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Simulate running the attack binary."""
+    try:
+        # Log the attack
+        logger.info(f"Attack started: Target={target_ip}, Duration={duration}, User={user_id}")
+        
+        # Simulating the attack process
+        for i in range(min(5, duration)):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Attack in progress: {i+1}/{duration} seconds completed..."
+            )
+            await asyncio.sleep(1)
+        
+        # If duration is longer than 5 seconds, we'll just skip to the end
+        if duration > 5:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Attack continuing... ({5}/{duration} seconds shown)"
+            )
+            # In a real scenario, you would actually wait the full duration
+            # For the example, we're just waiting 2 more seconds
+            await asyncio.sleep(2)
+        
+        # Attack completed
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Attack completed on {target_ip}!\nDuration: {duration} seconds"
+        )
+        
+        # In a real implementation, you would execute the binary like this:
+        # process = await asyncio.create_subprocess_exec(
+        #     ATTACK_BINARY_PATH, target_ip, str(duration),
+        #     stdout=asyncio.subprocess.PIPE,
+        #     stderr=asyncio.subprocess.PIPE
+        # )
+        # stdout, stderr = await process.communicate()
+        
+    except Exception as e:
+        logger.error(f"Attack error: {e}")
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"❌ Attack failed: {str(e)}"
+        )
+    finally:
+        # Remove user from active attacks
+        if user_id in attacks_in_progress:
+            attacks_in_progress.remove(user_id)
+
+def get_back_button() -> InlineKeyboardMarkup:
+    """Helper function to create a back button."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Back to Menu", callback_data="back")]])
+
+async def handle_key_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle key input for redeeming or adding coins."""
+    user_id = update.effective_user.id
+    key_text = update.message.text
+    
+    # Check if key exists
+    if key_text in keys:
+        key_info = keys[key_text]
+        
+        # Check if key has already been used
+        if key_info["used_by"] is not None:
+            await update.message.reply_text(
+                "This key has already been used.",
+                reply_markup=get_back_button()
+            )
+        else:
+            # Mark key as used
+            keys[key_text]["used_by"] = user_id
+            
+            # Add coins to user
+            users[user_id]["coins"] += key_info["value"]
+            
+            await update.message.reply_text(
+                f"Key redeemed successfully! You received {key_info['value']} coins.",
+                reply_markup=get_back_button()
+            )
+    else:
+        await update.message.reply_text(
+            "Invalid key. Please try again.",
+            reply_markup=get_back_button()
+        )
+
+def main() -> None:
+    """Start the bot."""
+    # Create the Application
+    application = Application.builder().token(TOKEN).build()
+    
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    
+    # Conversation handler for attack process
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_callback, pattern="^attack$")],
+        states={
+            WAITING_FOR_TARGET: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target_input),
+                CallbackQueryHandler(button_callback, pattern="^cancel$")
+            ],
+            WAITING_FOR_DURATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_duration_input),
+                CallbackQueryHandler(button_callback, pattern="^cancel$")
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(button_callback, pattern="^cancel$")],
+    )
+    application.add_handler(conv_handler)
+    
+    # Handler for button callbacks
+    application.add_handler(CallbackQueryHandler(confirm_attack, pattern="^confirm_attack$"))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Handler for key input
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_key_input))
+    
+    # Start the Bot
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
